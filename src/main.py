@@ -14,33 +14,77 @@ import argparse
 import subprocess
 import tempfile
 import time
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, List, Any, Optional
 
 class TxAdminRecipeProcessor:
-    def __init__(self, recipe_file: str, output_dir: str, verbose: bool = False):
+    def __init__(self, recipe_file: str, output_dir: str, verbose: bool = False, dry_run: bool = False):
         self.recipe_file = recipe_file
         self.output_dir = Path(output_dir).resolve()
         self.verbose = verbose
+        self.dry_run = dry_run
         self.temp_dir = None
         
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Create temp directory for downloads
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="txrecipe_"))
+        # Create temp directory for downloads (not needed in dry-run mode)
+        if not self.dry_run:
+            self.temp_dir = Path(tempfile.mkdtemp(prefix="txrecipe_"))
+        else:
+            self.temp_dir = None
         
     def log(self, message: str, level: str = "INFO"):
         """Log messages with optional verbosity"""
+        prefix = "[DRY-RUN] " if self.dry_run else ""
         if self.verbose or level in ["ERROR", "WARNING"]:
-            print(f"[{level}] {message}")
+            print(f"{prefix}[{level}] {message}")
+    
+    def _should_create_in_dry_run(self, path: Path) -> Path:
+        """Determine the parent folder structure that should be created in dry-run mode.
+        Only creates folders with [brackets], not the final resource folder."""
+        parts = path.parts
+        parent_parts = []
+        
+        for part in parts:
+            # Include all parts up to but not including the final resource name
+            # Only include parts that contain brackets or are standard paths
+            if '[' in part and ']' in part:
+                parent_parts.append(part)
+            elif part in ['resources', 'tmp'] or part.startswith('./'):
+                parent_parts.append(part)
+            else:
+                # This is likely the resource folder name - don't include it
+                break
+        
+        return Path(*parent_parts) if parent_parts else Path()
+    
+    def _is_commit_hash(self, ref: str) -> bool:
+        """Check if a ref looks like a commit hash (SHA)."""
+        return len(ref) >= 7 and re.match(r'^[a-f0-9]+$', ref.lower()) is not None
+    
+    def _retry_operation(self, operation, max_retries=3, delay=2):
+        """Retry an operation with exponential backoff."""
+        for attempt in range(max_retries):
+            try:
+                return operation()
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise e
+                wait_time = delay * (2 ** attempt)
+                self.log(f"Attempt {attempt + 1} failed: {e}", "WARNING")
+                self.log(f"Retrying in {wait_time} seconds...", "INFO")
+                time.sleep(wait_time)
     
     def cleanup(self):
         """Clean up temporary directory"""
         if self.temp_dir and self.temp_dir.exists():
             shutil.rmtree(self.temp_dir)
             self.log(f"Cleaned up temporary directory: {self.temp_dir}")
+        elif self.dry_run:
+            self.log("No cleanup needed in dry-run mode")
     
     def load_recipe(self) -> Dict[str, Any]:
         """Load and parse the txAdmin recipe YAML file"""
@@ -73,19 +117,52 @@ class TxAdminRecipeProcessor:
             self.log(f"Missing src or dest in download_github task", "WARNING")
             return False
         
-        # Extract repo info from GitHub URL
+        # Resolve destination path first
+        dest_path = self.output_dir / dest.lstrip('./')
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Handle placeholder URLs in dry-run mode
+        if self.dry_run:
+            # Only create parent directories with [brackets], not the resource folder itself
+            parent_path = self._should_create_in_dry_run(dest_path)
+            if parent_path and str(parent_path) != '.':
+                full_parent = self.output_dir / parent_path
+                full_parent.mkdir(parents=True, exist_ok=True)
+                self.log(f"Created parent structure: {full_parent}")
+            
+            # Extract resource name for logging
+            resource_name = dest_path.name
+            
+            if src == '<GITHUB_URL>':
+                # This is a placeholder URL
+                subpath_info = f" (subpath: {subpath})" if subpath else ""
+                self.log(f"Would clone [PLACEHOLDER_URL] → {resource_name} (ref: {ref}){subpath_info}")
+                self.log(f"  Target location: {dest_path}")
+            else:
+                # Try to extract repo info from actual URL
+                parts = urlparse(src)
+                path_parts = parts.path.strip('/').split('/')
+                if len(path_parts) >= 2:
+                    owner = path_parts[0]
+                    repo = path_parts[1]
+                    subpath_info = f" (subpath: {subpath})" if subpath else ""
+                    self.log(f"Would clone {owner}/{repo} (ref: {ref}){subpath_info} → {resource_name}")
+                    self.log(f"  Target location: {dest_path}")
+                else:
+                    # Invalid URL format - warn but don't fail
+                    self.log(f"Would clone [INVALID_URL: {src}] → {resource_name}", "WARNING")
+                    self.log(f"  Target location: {dest_path}")
+            return True
+        
+        # For actual cloning, validate the URL
         parts = urlparse(src)
         path_parts = parts.path.strip('/').split('/')
-        if len(path_parts) < 2:
+        if len(path_parts) < 2 or src == '<GITHUB_URL>':
             self.log(f"Invalid GitHub URL: {src}", "WARNING")
             return False
         
         owner = path_parts[0]
         repo = path_parts[1]
-        
-        # Resolve destination path
-        dest_path = self.output_dir / dest.lstrip('./')
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
         
         self.log(f"Cloning {owner}/{repo} (ref: {ref}) to {dest_path}")
         
@@ -93,22 +170,52 @@ class TxAdminRecipeProcessor:
         temp_clone_dir = self.temp_dir / f"{owner}_{repo}_{ref}"
         
         try:
-            # Use git clone with specific branch/ref
-            cmd = ['git', 'clone', '--depth', '1', '--branch', ref, src, str(temp_clone_dir)]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                # Try without --branch flag (might be a commit hash)
+            # Determine the best cloning strategy based on ref type
+            if self._is_commit_hash(ref):
+                # For commit hashes, clone full repo then checkout
+                self.log(f"Detected commit hash, cloning full repository...")
                 cmd = ['git', 'clone', src, str(temp_clone_dir)]
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                
+                if result.returncode == 0:
+                    # Checkout the specific commit
+                    checkout_result = subprocess.run(
+                        ['git', 'checkout', ref], 
+                        cwd=temp_clone_dir, 
+                        capture_output=True, 
+                        text=True,
+                        timeout=60
+                    )
+                    if checkout_result.returncode != 0:
+                        self.log(f"Failed to checkout {ref}: {checkout_result.stderr}", "ERROR")
+                        return False
+            else:
+                # For branch names, try shallow clone first
+                self.log(f"Attempting shallow clone of branch '{ref}'...")
+                cmd = ['git', 'clone', '--depth', '1', '--branch', ref, src, str(temp_clone_dir)]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                 
                 if result.returncode != 0:
-                    self.log(f"Failed to clone repository: {result.stderr}", "ERROR")
-                    return False
-                
-                # Checkout specific ref if it's not a branch
-                if ref != 'main' and ref != 'master':
-                    subprocess.run(['git', 'checkout', ref], cwd=temp_clone_dir, capture_output=True)
+                    # Fallback: try without branch specification (use default branch)
+                    self.log(f"Shallow clone failed, trying default branch...")
+                    cmd = ['git', 'clone', '--depth', '1', src, str(temp_clone_dir)]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                    
+                    if result.returncode == 0 and ref not in ['main', 'master']:
+                        # Try to checkout the ref if it exists
+                        checkout_result = subprocess.run(
+                            ['git', 'checkout', ref], 
+                            cwd=temp_clone_dir, 
+                            capture_output=True, 
+                            text=True,
+                            timeout=60
+                        )
+                        if checkout_result.returncode != 0:
+                            self.log(f"Warning: Could not checkout '{ref}', using default branch", "WARNING")
+            
+            if result.returncode != 0:
+                self.log(f"Failed to clone repository {src}: {result.stderr}", "ERROR")
+                return False
             
             # Remove .git directory to save space
             git_dir = temp_clone_dir / '.git'
@@ -120,7 +227,15 @@ class TxAdminRecipeProcessor:
             if subpath:
                 source_dir = temp_clone_dir / subpath
                 if not source_dir.exists():
-                    self.log(f"Subpath {subpath} not found in repository", "WARNING")
+                    self.log(f"Subpath '{subpath}' not found in repository {owner}/{repo}", "ERROR")
+                    self.log(f"Available paths in repository:", "INFO")
+                    try:
+                        for item in sorted(temp_clone_dir.rglob('*')):
+                            if item.is_dir() and not str(item.name).startswith('.'):
+                                rel_path = item.relative_to(temp_clone_dir)
+                                self.log(f"  {rel_path}", "INFO")
+                    except Exception:
+                        self.log(f"  Could not list repository contents", "INFO")
                     return False
             
             # Move to destination
@@ -137,8 +252,11 @@ class TxAdminRecipeProcessor:
             self.log(f"Successfully cloned {owner}/{repo} to {dest_path}")
             return True
             
+        except subprocess.TimeoutExpired:
+            self.log(f"Timeout while cloning repository {src}", "ERROR")
+            return False
         except Exception as e:
-            self.log(f"Error processing GitHub download: {e}", "ERROR")
+            self.log(f"Error processing GitHub download {src}: {e}", "ERROR")
             return False
     
     def process_download_file(self, task: Dict[str, Any]) -> bool:
@@ -153,6 +271,11 @@ class TxAdminRecipeProcessor:
         # Resolve destination path
         dest_path = self.output_dir / path.lstrip('./')
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        if self.dry_run:
+            # In dry-run mode, just create the parent directory
+            self.log(f"Would download {url} to {dest_path}")
+            return True
         
         self.log(f"Downloading {url} to {dest_path}")
         
@@ -183,6 +306,12 @@ class TxAdminRecipeProcessor:
         # Resolve paths
         src_path = self.output_dir / src.lstrip('./')
         dest_path = self.output_dir / dest.lstrip('./')
+        
+        if self.dry_run:
+            # In dry-run mode, just create the destination directory
+            dest_path.mkdir(parents=True, exist_ok=True)
+            self.log(f"Would extract {src_path} to {dest_path}")
+            return True
         
         if not src_path.exists():
             self.log(f"Source zip file not found: {src_path}", "WARNING")
@@ -216,6 +345,13 @@ class TxAdminRecipeProcessor:
         # Resolve paths
         src_path = self.output_dir / src.lstrip('./')
         dest_path = self.output_dir / dest.lstrip('./')
+        
+        if self.dry_run:
+            # In dry-run mode, just create the destination directory structure
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            overwrite_info = " (overwrite)" if overwrite else ""
+            self.log(f"Would move {src_path} to {dest_path}{overwrite_info}")
+            return True
         
         if not src_path.exists():
             self.log(f"Source path not found: {src_path}", "WARNING")
@@ -255,6 +391,11 @@ class TxAdminRecipeProcessor:
         # Resolve path
         target_path = self.output_dir / path.lstrip('./')
         
+        if self.dry_run:
+            # In dry-run mode, just log what would be removed
+            self.log(f"Would remove {target_path}")
+            return True
+        
         if not target_path.exists():
             self.log(f"Path to remove not found: {target_path}", "WARNING")
             return True  # Not an error if it doesn't exist
@@ -279,8 +420,11 @@ class TxAdminRecipeProcessor:
         seconds = task.get('seconds', 0)
         
         if seconds > 0:
-            self.log(f"Waiting {seconds} seconds (throttling)...")
-            time.sleep(seconds)
+            if self.dry_run:
+                self.log(f"Would wait {seconds} seconds (throttling)")
+            else:
+                self.log(f"Waiting {seconds} seconds (throttling)...")
+                time.sleep(seconds)
         
         return True
     
@@ -324,8 +468,14 @@ class TxAdminRecipeProcessor:
         failed = 0
         skipped = 0
         
-        print(f"\nProcessing {total_tasks} tasks...")
+        mode_text = "DRY-RUN MODE: Creating folder structure" if self.dry_run else "Processing"
+        print(f"\n{mode_text} for {total_tasks} tasks...")
         print("=" * 60)
+        
+        if self.dry_run:
+            print("Note: Dry-run will only create parent folders with [brackets]")
+            print("Resource folders will be created during actual clone operations")
+            print("=" * 60)
         
         for i, task in enumerate(tasks, 1):
             # Check if task is commented (None value from YAML)
@@ -334,7 +484,11 @@ class TxAdminRecipeProcessor:
                 continue
             
             action = task.get('action', 'unknown')
-            print(f"\n[{i}/{total_tasks}] Processing: {action}")
+            dest = task.get('dest', task.get('path', 'unknown'))
+            progress_percent = round((i / total_tasks) * 100)
+            print(f"\n[{i}/{total_tasks}] ({progress_percent}%) Processing: {action}")
+            if dest != 'unknown':
+                print(f"  → {dest}")
             
             if self.process_task(task):
                 successful += 1
@@ -354,10 +508,12 @@ def main():
     parser = argparse.ArgumentParser(description='Process txAdmin recipe files')
     parser.add_argument('recipe', nargs='?', default='txAdminRecipe.yaml',
                         help='Path to the txAdminRecipe.yaml file')
-    parser.add_argument('-o', '--output', default='../fivem-server',
+    parser.add_argument('-o', '--output', default='./fivem-server',
                         help='Output directory for the server files')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Enable verbose output')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Create folder structure without cloning repositories')
     
     args = parser.parse_args()
     
@@ -365,7 +521,7 @@ def main():
         print(f"Error: Recipe file not found: {args.recipe}")
         sys.exit(1)
     
-    processor = TxAdminRecipeProcessor(args.recipe, args.output, args.verbose)
+    processor = TxAdminRecipeProcessor(args.recipe, args.output, args.verbose, args.dry_run)
     
     try:
         processor.process()
